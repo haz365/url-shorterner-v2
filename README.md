@@ -167,4 +167,4 @@ terraform destroy \
 | State | S3 + DynamoDB locking |
 | CI | GitHub Actions |
 | Auth | OIDC (no secrets) |
-| Logs | CloudWatch |
+| Logs | CloudWatch | TTT
