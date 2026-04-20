@@ -1,0 +1,19 @@
+# Node dependencies — reinstalled inside container
+node_modules
+npm-debug.log
+
+# Git history
+.git
+.gitignore
+
+# Environment files — never ship secrets
+.env
+.env.*
+
+# Terraform — not needed in app image
+terraform/
+
+# Docs and editor files
+*.md
+.vscode/
+.DS_Store
