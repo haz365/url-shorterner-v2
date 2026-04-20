@@ -1,11 +1,11 @@
 # ═══════════════════════════════════════════════════════════════
-# CI PIPELINE
-# Runs on every push to any branch
-# Tests the Node.js app — no AWS credentials needed
-# Deploy is done manually via docker push + ecs update-service
+# CI/CD PIPELINE
+# On every push to ANY branch → runs tests
+# On every push to MAIN → runs tests then deploys
+# Uses OIDC — no long lived AWS credentials stored anywhere
 # ═══════════════════════════════════════════════════════════════
 
-name: CI
+name: CI/CD
 
 on:
   push:
@@ -13,7 +13,14 @@ on:
   pull_request:
     branches: ["**"]
 
+permissions:
+  id-token: write   # Required for OIDC
+  contents: read
+
 jobs:
+  # ─── Job 1: Test ─────────────────────────────────────────
+  # Runs on EVERY push to ANY branch
+  # No AWS credentials needed
   test:
     name: Run tests
     runs-on: ubuntu-latest
@@ -36,3 +43,91 @@ jobs:
       - name: Run tests
         run: npm test
         working-directory: ./app
+
+  # ─── Job 2: Deploy ───────────────────────────────────────
+  # Only runs on push to MAIN branch
+  # Only runs if tests passed (needs: test)
+  # Skips gracefully if infrastructure doesn't exist
+  deploy:
+    name: Build and Deploy
+    runs-on: ubuntu-latest
+    needs: test   # ← won't run if tests fail
+    if: github.ref == 'refs/heads/main'   # ← main branch only
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Authenticate to AWS via OIDC
+      # No access keys stored anywhere — temporary token only
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::989346120260:role/url-shortener-v2-github-actions-role
+          aws-region: eu-west-2
+
+      # Check infrastructure exists before trying to deploy
+      # If terraform hasn't been applied yet, skip gracefully
+      - name: Check if ECS cluster exists
+        id: check-infra
+        run: |
+          if aws ecs describe-clusters \
+            --clusters url-shortener-v2-cluster \
+            --region eu-west-2 \
+            --query 'clusters[0].status' \
+            --output text 2>/dev/null | grep -q "ACTIVE"; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "✅ Infrastructure found — deploying!"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "⚠️ Infrastructure not found — skipping deploy"
+          fi
+
+      # Log Docker into ECR (only if infra exists)
+      - name: Login to Amazon ECR
+        if: steps.check-infra.outputs.exists == 'true'
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Build, tag and push Docker image (only if infra exists)
+      - name: Build, tag and push image
+        if: steps.check-infra.outputs.exists == 'true'
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: url-shortener-v2
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Build for linux/amd64 — required for ECS Fargate
+          # Your Mac builds ARM by default so we must specify this
+          docker build \
+            --platform linux/amd64 \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            .
+
+          # Push both tags
+          # SHA tag = traceable (know exactly which commit is live)
+          # latest tag = convenience
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+          echo "✅ Image pushed: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+      # Force ECS to pull new image (only if infra exists)
+      - name: Deploy to ECS
+        if: steps.check-infra.outputs.exists == 'true'
+        run: |
+          aws ecs update-service \
+            --cluster url-shortener-v2-cluster \
+            --service url-shortener-v2-service \
+            --force-new-deployment \
+            --region eu-west-2
+
+          echo "✅ Deployment triggered!"
+          echo "🔗 Monitor: AWS Console → ECS → url-shortener-v2-cluster"
+
+      # Friendly message when skipping deploy
+      - name: Skipping deploy
+        if: steps.check-infra.outputs.exists == 'false'
+        run: |
+          echo "⚠️ Skipped — run terraform apply first"
